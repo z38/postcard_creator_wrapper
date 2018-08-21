@@ -3,6 +3,7 @@ import requests
 import json
 from bs4 import BeautifulSoup
 from requests_toolbelt.utils import dump
+from urllib.parse import urlparse, parse_qs
 import datetime
 from PIL import Image
 from io import BytesIO
@@ -119,37 +120,65 @@ class Token(object):
         logger.debug('username/password authentication was successful')
 
     def _get_saml_response(self, session, username, password):
-        url = '{}/SAML/IdentityProvider/'.format(self.base)
-        query = '?login&app=pcc&service=pcc&targetURL=https%3A%2F%2Fpostcardcreator.post.ch' + \
+        init_url = '{}/SAML/IdentityProvider/'.format(self.base)
+        init_query = '?login&app=pcc&service=pcc&targetURL=https%3A%2F%2Fpostcardcreator.post.ch' + \
                 '&abortURL=https%3A%2F%2Fpostcardcreator.post.ch&inMobileApp=true'
-        data = {
-            'isiwebuserid': username,
-            'isiwebpasswd': password,
-            'confirmLogin': ''
+        init_data = {
+            'isiwebuserid': '',
+            'isiwebpasswd': '',
+            'externalIDP': 'externalIDP',
         }
-        response1 = session.get(url=url + query, headers=self.headers)
-        _trace_request(response1)
-        logger.debug(' get {}'.format(url))
+        init_response = session.get(url=init_url + init_query, headers=self.headers)
+        _trace_request(init_response)
+        logger.debug(' get {}'.format(init_url))
 
-        response2 = session.post(url=url + query, headers=self.headers, data=data)
-        _trace_request(response2)
-        logger.debug(' post {}'.format(url))
+        swissid_ui_response = session.post(url=init_response.url, headers=self.headers, data=init_data)
+        _trace_request(swissid_ui_response)
 
-        response3 = session.post(url=url + query, headers=self.headers)
-        _trace_request(response3)
-        logger.debug(' post {}'.format(url))
+        swissid_ui_url = urlparse(swissid_ui_response.url)
+        swissid_headers = {
+            'Referer': swissid_ui_response.url,
+            'Accept-API-Version': 'protocol=1.0,resource=2.1',
+        }
+        swissid_query = parse_qs(swissid_ui_url.query)
+        swissid_realm = swissid_query.pop('realm').pop()
+        swissid_url = 'https://login.swissid.ch/idp/json/realms/root/realms{}/authenticate'.format(swissid_realm)
 
-        if any(e.status_code is not 200 for e in [response1, response2, response3]):
+        swissid_response = session.post(swissid_url, params=swissid_query, headers=swissid_headers, json={})
+        _trace_request(swissid_response)
+        swissid_state = swissid_response.json()
+        for cb in swissid_state['callbacks']:
+            if cb['type'] == 'NameCallback':
+                cb['input'][0]['value'] = username
+
+        swissid_response = session.post(swissid_url, params=swissid_query, headers=swissid_headers, json=swissid_state)
+        _trace_request(swissid_response)
+        swissid_state = swissid_response.json()
+        for cb in swissid_state['callbacks']:
+            if cb['type'] == 'PasswordCallback':
+                cb['input'][0]['value'] = password
+
+        swissid_response = session.post(swissid_url, params=swissid_query, headers=swissid_headers, json=swissid_state)
+        _trace_request(swissid_response)
+        swissid_state = swissid_response.json()
+        if 'successUrl' not in swissid_state:
             raise PostcardCreatorException('Wrong user credentials')
 
-        soup = BeautifulSoup(response3.text, 'html.parser')
-        saml_response = soup.find('input', {'name': 'SAMLResponse'})
+        success_response = session.get(swissid_state['successUrl'])
+        _trace_request(success_response)
+        soup = BeautifulSoup(success_response.text, 'html.parser')
+        saml_form = soup.find('form')
+        if not saml_form:
+            raise PostcardCreatorException('Could not find SAML endpoint')
 
-        if saml_response is None or saml_response.get('value') is None:
-            raise PostcardCreatorException('Username/password authentication failed. '
-                                           'Are your credentials valid?.')
+        saml_response = session.post(saml_form.get('action'))
+        _trace_request(saml_response)
+        soup = BeautifulSoup(saml_response.text, 'html.parser')
+        saml_input = soup.find('input', {'name': 'SAMLResponse'})
+        if not saml_input:
+            raise PostcardCreatorException('Could not find SAML response')
 
-        return saml_response.get('value')
+        return saml_input.get('value')
 
     def to_json(self):
         return {
